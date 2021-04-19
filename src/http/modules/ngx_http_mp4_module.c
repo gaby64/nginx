@@ -521,12 +521,6 @@ ngx_http_mp4_handler(ngx_http_request_t *r)
     }
 
     if (!of.is_file) {
-
-        if (ngx_close_file(of.fd) == NGX_FILE_ERROR) {
-            ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
-                          ngx_close_file_n " \"%s\" failed", path.data);
-        }
-
         return NGX_DECLINED;
     }
 
@@ -3116,6 +3110,13 @@ ngx_http_mp4_update_stsz_atom(ngx_http_mp4_file_t *mp4,
                        "chunk samples sizes:%uL",
                        trak->start_chunk_samples_size);
 
+        if (trak->start_chunk_samples_size > (uint64_t) mp4->end) {
+            ngx_log_error(NGX_LOG_ERR, mp4->file.log, 0,
+                          "too large mp4 start samples size in \"%s\"",
+                          mp4->file.name.data);
+            return NGX_ERROR;
+        }
+
         if (mp4->length) {
             if (trak->end_sample - trak->start_sample > entries) {
                 ngx_log_error(NGX_LOG_ERR, mp4->file.log, 0,
@@ -3135,6 +3136,13 @@ ngx_http_mp4_update_stsz_atom(ngx_http_mp4_file_t *mp4,
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
                            "mp4 stsz end_chunk_samples_size:%uL",
                            trak->end_chunk_samples_size);
+
+            if (trak->end_chunk_samples_size > (uint64_t) mp4->end) {
+                ngx_log_error(NGX_LOG_ERR, mp4->file.log, 0,
+                              "too large mp4 end samples size in \"%s\"",
+                              mp4->file.name.data);
+                return NGX_ERROR;
+            }
         }
 
         atom_size = sizeof(ngx_mp4_stsz_atom_t) + (data->last - data->pos);
@@ -3226,6 +3234,7 @@ ngx_http_mp4_update_stco_atom(ngx_http_mp4_file_t *mp4,
 {
     size_t                atom_size;
     uint32_t              entries;
+    uint64_t              chunk_offset, samples_size;
     ngx_buf_t            *atom, *data;
     ngx_mp4_stco_atom_t  *stco_atom;
 
@@ -3256,8 +3265,19 @@ ngx_http_mp4_update_stco_atom(ngx_http_mp4_file_t *mp4,
 
     data->pos += trak->start_chunk * sizeof(uint32_t);
 
-    trak->start_offset = ngx_mp4_get_32value(data->pos);
-    trak->start_offset += trak->start_chunk_samples_size;
+    chunk_offset = ngx_mp4_get_32value(data->pos);
+    samples_size = trak->start_chunk_samples_size;
+
+    if (chunk_offset > (uint64_t) mp4->end - samples_size
+        || chunk_offset + samples_size > NGX_MAX_UINT32_VALUE)
+    {
+        ngx_log_error(NGX_LOG_ERR, mp4->file.log, 0,
+                      "too large chunk offset in \"%s\"",
+                      mp4->file.name.data);
+        return NGX_ERROR;
+    }
+
+    trak->start_offset = chunk_offset + samples_size;
     ngx_mp4_set_32value(data->pos, trak->start_offset);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
@@ -3276,9 +3296,19 @@ ngx_http_mp4_update_stco_atom(ngx_http_mp4_file_t *mp4,
         data->last = data->pos + entries * sizeof(uint32_t);
 
         if (entries) {
-            trak->end_offset =
-                            ngx_mp4_get_32value(data->last - sizeof(uint32_t));
-            trak->end_offset += trak->end_chunk_samples_size;
+            chunk_offset = ngx_mp4_get_32value(data->last - sizeof(uint32_t));
+            samples_size = trak->end_chunk_samples_size;
+
+            if (chunk_offset > (uint64_t) mp4->end - samples_size
+                || chunk_offset + samples_size > NGX_MAX_UINT32_VALUE)
+            {
+                ngx_log_error(NGX_LOG_ERR, mp4->file.log, 0,
+                              "too large chunk offset in \"%s\"",
+                              mp4->file.name.data);
+                return NGX_ERROR;
+            }
+
+            trak->end_offset = chunk_offset + samples_size;
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
                            "end chunk offset:%O", trak->end_offset);
@@ -3409,7 +3439,7 @@ ngx_http_mp4_update_co64_atom(ngx_http_mp4_file_t *mp4,
     ngx_http_mp4_trak_t *trak)
 {
     size_t                atom_size;
-    uint64_t              entries;
+    uint64_t              entries, chunk_offset, samples_size;
     ngx_buf_t            *atom, *data;
     ngx_mp4_co64_atom_t  *co64_atom;
 
@@ -3440,8 +3470,17 @@ ngx_http_mp4_update_co64_atom(ngx_http_mp4_file_t *mp4,
 
     data->pos += trak->start_chunk * sizeof(uint64_t);
 
-    trak->start_offset = ngx_mp4_get_64value(data->pos);
-    trak->start_offset += trak->start_chunk_samples_size;
+    chunk_offset = ngx_mp4_get_64value(data->pos);
+    samples_size = trak->start_chunk_samples_size;
+
+    if (chunk_offset > (uint64_t) mp4->end - samples_size) {
+        ngx_log_error(NGX_LOG_ERR, mp4->file.log, 0,
+                      "too large chunk offset in \"%s\"",
+                      mp4->file.name.data);
+        return NGX_ERROR;
+    }
+
+    trak->start_offset = chunk_offset + samples_size;
     ngx_mp4_set_64value(data->pos, trak->start_offset);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
@@ -3460,9 +3499,17 @@ ngx_http_mp4_update_co64_atom(ngx_http_mp4_file_t *mp4,
         data->last = data->pos + entries * sizeof(uint64_t);
 
         if (entries) {
-            trak->end_offset =
-                            ngx_mp4_get_64value(data->last - sizeof(uint64_t));
-            trak->end_offset += trak->end_chunk_samples_size;
+            chunk_offset = ngx_mp4_get_64value(data->last - sizeof(uint64_t));
+            samples_size = trak->end_chunk_samples_size;
+
+            if (chunk_offset > (uint64_t) mp4->end - samples_size) {
+                ngx_log_error(NGX_LOG_ERR, mp4->file.log, 0,
+                              "too large chunk offset in \"%s\"",
+                              mp4->file.name.data);
+                return NGX_ERROR;
+            }
+
+            trak->end_offset = chunk_offset + samples_size;
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, mp4->file.log, 0,
                            "end chunk offset:%O", trak->end_offset);
