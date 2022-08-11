@@ -9,6 +9,59 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
+#ifndef BSSL_NO_ECH
+    #include <sys/types.h>
+    #include <sys/stat.h>
+    #include <dirent.h>
+
+    #define ECH_GREASE_UNKNOWN -1 /**< when we're not yet sure */
+    #define ECH_NOT_GREASE 0 /**< when decryption worked */
+    #define ECH_IS_GREASE 1 /**< when decryption failed or GREASE wanted */
+
+    #define SSL_ECH_STATUS_BACKEND    4 /**< ECH backend: saw an ech_is_inner */
+    #define SSL_ECH_STATUS_GREASE_ECH 3 /**< We GREASEd and got an ECH in return */
+    #define SSL_ECH_STATUS_GREASE     2 /**< ECH GREASE happened  */
+    #define SSL_ECH_STATUS_SUCCESS    1 /**< Success */
+    #define SSL_ECH_STATUS_FAILED     0 /**< Some internal or protocol error */
+    #define SSL_ECH_STATUS_BAD_CALL   -100 /**< Some in/out arguments were NULL */
+    #define SSL_ECH_STATUS_NOT_TRIED  -101 /**< ECH wasn't attempted  */
+    #define SSL_ECH_STATUS_BAD_NAME   -102 /**< ECH ok but server cert mis-match */
+    #define SSL_ECH_STATUS_NOT_CONFIGURED  -103 /**< ECH wasn't configured */
+    #define SSL_ECH_STATUS_FAILED_ECH -105 /**< We tried, failed and got an ECH */
+
+    /**
+     * @brief check ECH outcome, post-handshake
+     * @param s the SSL session
+     * @return 1 for success, other otherwise
+     *
+     * This can be called by applications after the TLS handshake is complete. 
+     * This works for both client and server.
+     */
+    int SSL_ech_get_status(ngx_connection_t *c)
+    {
+        ngx_ssl_conn_t *s = c->ssl->connection;
+
+        if(SSL_ech_accepted(s)) {
+            long vr=X509_V_OK;
+            vr=SSL_get_verify_result(s);
+            if (vr == X509_V_OK ) return SSL_ECH_STATUS_SUCCESS;
+            else return SSL_ECH_STATUS_BAD_NAME;
+        }
+        else {
+            size_t publicname_len;
+            const char *publicname;
+            SSL_get0_ech_name_override(s, &publicname, &publicname_len);
+            if(publicname_len) {
+                ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0, "ECH status publicname: %.*s", publicname_len, publicname);
+                return SSL_ECH_STATUS_FAILED;
+            }
+            else
+                return SSL_ECH_STATUS_NOT_TRIED;
+        }
+    }
+
+    static void ssl_trace(int direction, int ssl_ver, int content_type, const void *buf, size_t len, SSL *ssl, void *arg);
+#endif
 
 #define NGX_SSL_PASSWORD_BUFFER_SIZE  4096
 
@@ -387,6 +440,14 @@ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
 #ifdef SSL_MODE_NO_AUTO_CHAIN
     SSL_CTX_set_mode(ssl->ctx, SSL_MODE_NO_AUTO_CHAIN);
 #endif
+
+#ifndef BSSL_NO_ECH
+#if (NGX_DEBUG)
+    SSL_CTX_set_msg_callback(ssl->ctx, ssl_trace);
+    SSL_CTX_set_msg_callback_arg(ssl->ctx, ssl->log);
+#endif
+#endif
+
 
     SSL_CTX_set_read_ahead(ssl->ctx, 1);
 
@@ -1130,7 +1191,31 @@ ngx_ssl_info_callback(const ngx_ssl_conn_t *ssl_conn, int where, int ret)
             }
         }
     }
+#endif
 
+#ifndef BSSL_NO_ECH
+    if ((where & SSL_CB_HANDSHAKE_DONE) == SSL_CB_HANDSHAKE_DONE) {
+        c = ngx_ssl_get_connection((ngx_ssl_conn_t *) ssl_conn);
+
+        int echrv=SSL_ech_get_status(c);
+        switch (echrv) {
+            case SSL_ECH_STATUS_NOT_TRIED:
+                ngx_ssl_error(NGX_LOG_INFO, c->log, 0, "ECH not attempted");
+                break;
+            case SSL_ECH_STATUS_FAILED:
+                ngx_ssl_error(NGX_LOG_ERR, c->log, 0, "ECH tried but failed");
+                break;
+            case SSL_ECH_STATUS_BAD_NAME:
+                ngx_ssl_error(NGX_LOG_ERR, c->log, 0, "ECH worked but bad name");
+                break;
+            case SSL_ECH_STATUS_SUCCESS:
+                ngx_ssl_error(NGX_LOG_NOTICE, c->log, 0, "ECH success");
+                break;
+            default:
+                ngx_ssl_error(NGX_LOG_ERR, c->log, 0, "Error getting ECH status");
+                break;
+        }
+    }
 #endif
 
     if ((where & SSL_CB_ACCEPT_LOOP) == SSL_CB_ACCEPT_LOOP) {
@@ -1368,6 +1453,381 @@ ngx_ssl_passwords_cleanup(void *data)
     }
 }
 
+#ifndef BSSL_NO_ECH
+
+
+static const char *ssl_msg_type(int ssl_ver, int msg)
+{
+#ifdef SSL2_VERSION_MAJOR
+  if(ssl_ver == SSL2_VERSION_MAJOR) {
+    switch(msg) {
+      case SSL2_MT_ERROR:
+        return "Error";
+      case SSL2_MT_CLIENT_HELLO:
+        return "Client hello";
+      case SSL2_MT_CLIENT_MASTER_KEY:
+        return "Client key";
+      case SSL2_MT_CLIENT_FINISHED:
+        return "Client finished";
+      case SSL2_MT_SERVER_HELLO:
+        return "Server hello";
+      case SSL2_MT_SERVER_VERIFY:
+        return "Server verify";
+      case SSL2_MT_SERVER_FINISHED:
+        return "Server finished";
+      case SSL2_MT_REQUEST_CERTIFICATE:
+        return "Request CERT";
+      case SSL2_MT_CLIENT_CERTIFICATE:
+        return "Client CERT";
+    }
+  }
+  else
+#endif
+  if(ssl_ver == SSL3_VERSION_MAJOR) {
+    switch(msg) {
+      case SSL3_MT_HELLO_REQUEST:
+        return "Hello request";
+      case SSL3_MT_CLIENT_HELLO:
+        return "Client hello";
+      case SSL3_MT_SERVER_HELLO:
+        return "Server hello";
+#ifdef SSL3_MT_NEWSESSION_TICKET
+      case SSL3_MT_NEWSESSION_TICKET:
+        return "Newsession Ticket";
+#endif
+      case SSL3_MT_CERTIFICATE:
+        return "Certificate";
+      case SSL3_MT_SERVER_KEY_EXCHANGE:
+        return "Server key exchange";
+      case SSL3_MT_CLIENT_KEY_EXCHANGE:
+        return "Client key exchange";
+      case SSL3_MT_CERTIFICATE_REQUEST:
+        return "Request CERT";
+      case SSL3_MT_SERVER_DONE:
+        return "Server finished";
+      case SSL3_MT_CERTIFICATE_VERIFY:
+        return "CERT verify";
+      case SSL3_MT_FINISHED:
+        return "Finished";
+#ifdef SSL3_MT_CERTIFICATE_STATUS
+      case SSL3_MT_CERTIFICATE_STATUS:
+        return "Certificate Status";
+#endif
+#ifdef SSL3_MT_ENCRYPTED_EXTENSIONS
+      case SSL3_MT_ENCRYPTED_EXTENSIONS:
+        return "Encrypted Extensions";
+#endif
+#ifdef SSL3_MT_SUPPLEMENTAL_DATA
+      case SSL3_MT_SUPPLEMENTAL_DATA:
+        return "Supplemental data";
+#endif
+#ifdef SSL3_MT_END_OF_EARLY_DATA
+      case SSL3_MT_END_OF_EARLY_DATA:
+        return "End of early data";
+#endif
+#ifdef SSL3_MT_KEY_UPDATE
+      case SSL3_MT_KEY_UPDATE:
+        return "Key update";
+#endif
+#ifdef SSL3_MT_NEXT_PROTO
+      case SSL3_MT_NEXT_PROTO:
+        return "Next protocol";
+#endif
+#ifdef SSL3_MT_MESSAGE_HASH
+      case SSL3_MT_MESSAGE_HASH:
+        return "Message hash";
+#endif
+    }
+  }
+  return "Unknown";
+}
+
+static const char *tls_rt_type(int type)
+{
+  switch(type) {
+#ifdef SSL3_RT_HEADER
+  case SSL3_RT_HEADER:
+    return "TLS header";
+#endif
+  case SSL3_RT_CHANGE_CIPHER_SPEC:
+    return "TLS change cipher";
+  case SSL3_RT_ALERT:
+    return "TLS alert";
+  case SSL3_RT_HANDSHAKE:
+    return "TLS handshake";
+  case SSL3_RT_APPLICATION_DATA:
+    return "TLS app data";
+  case SSL3_RT_CLIENT_HELLO_INNER:
+    return "TLS client hello inner";
+  default:
+    return "TLS Unknown";
+  }
+}
+
+/*
+ * Our callback from the SSL/TLS layers.
+ */
+static void ssl_trace(int direction, int ssl_ver, int content_type, const void *buf, size_t len, SSL *ssl, void *arg)
+{
+    char unknown[32];
+    const char *verstr = NULL;
+    char pbuf[6144] = "";
+    char hex[4] = "";
+    ngx_log_t *log = arg;
+    switch(ssl_ver) {
+        case TLS1_1_VERSION:
+            verstr = "TLSv1.1";
+            break;
+        case TLS1_2_VERSION:
+            verstr = "TLSv1.2";
+            break;
+        case TLS1_3_VERSION:
+            verstr = "TLSv1.3";
+            break;
+        case SSL2_VERSION:
+            verstr = "SSLv2";
+            break;
+        case SSL3_VERSION:
+            verstr = "SSLv3";
+            break;
+        case 0:
+            break;
+        default:
+            snprintf(unknown, sizeof(unknown), "(%x)", ssl_ver);
+            verstr = unknown;
+            break;
+    }
+    if(ssl_ver) {
+        const char *msg_name, *tls_rt_name;
+        int msg_type;
+        ssl_ver >>= 8; //check the upper 8 bits only below always pass-up content-type as 0. But the interesting message-type is at 'buf[0]'.
+        if(ssl_ver == SSL3_VERSION_MAJOR && content_type)
+            tls_rt_name = tls_rt_type(content_type);
+        else
+            tls_rt_name = "";
+        if(content_type == SSL3_RT_CHANGE_CIPHER_SPEC) {
+            msg_type = *(char *)buf;
+            msg_name = "Change cipher spec";
+        }
+        else if(content_type == SSL3_RT_ALERT) {
+            msg_type = (((char *)buf)[0] << 8) + ((char *)buf)[1];
+            msg_name = SSL_alert_desc_string_long(msg_type);
+        }
+        else {
+            msg_type = *(char *)buf;
+            msg_name = ssl_msg_type(ssl_ver, msg_type);
+        }
+        for(size_t i=0; i < len && i < sizeof(pbuf)/2; i++) {
+            if(snprintf(hex, sizeof(hex), "%02hhX", ((unsigned char *)buf)[i]) < 0)
+                break;
+            strcat(pbuf, hex);
+        }
+        ngx_log_debug8(NGX_LOG_DEBUG_EVENT, log, 0, "ssl_trace %s(%d) (%s), %s, %s (%d:%d): %d", verstr, ssl_ver, direction?">>":"<<", tls_rt_name, msg_name, msg_type, content_type, (int)len);
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, log, 0, "ssl_trace %s\n", pbuf);
+    }
+    //ngx_ssl_error(NGX_LOG_NOTICE, log, 0, "%s", pbuf);
+}
+
+uint8_t *readfile(char *filepath, size_t *rd) {
+    FILE *fptr;
+    long length;
+    uint8_t *output;
+    fptr = fopen(filepath, "rb");
+    if (fptr) {
+        fseek(fptr, 0L, SEEK_END);
+        length = ftell(fptr);
+        rewind(fptr);
+        output = malloc(length);
+        *rd = fread(output, 1, length, fptr);
+        fclose(fptr);
+        return output;
+    }
+    *rd = 0;
+    return NULL;
+}
+
+/* 
+ * load any file pair key and echconfig, <name>.key <name>.ech, we find in the ssl_echkeydir directory
+ *  
+ */
+static int load_echkeys(ngx_ssl_t *ssl, ngx_str_t *dirname)
+{
+    /*
+     * Try load any good looking public/private ECH values found in files in that directory
+     *
+     * This code is derived from what I added to openssl s_server, (and then lighttpd) which 
+     * you can find around https://github.com/sftcd/lighttpd1.4/blob/master/src/mod_openssl.c#L984
+     *
+     */
+    ngx_dir_t thedir;
+    ngx_int_t nrv=ngx_open_dir(dirname,&thedir);
+    if (nrv!=NGX_OK) {
+        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "load_echkeys, error opening %s at %d",dirname->data,__LINE__);
+        return NGX_ERROR;
+    }
+    int maxkeyfiles=1024;
+    char privname[PATH_MAX];
+    char **map = malloc(sizeof(char *) * maxkeyfiles); //index is key * 2 for array, string is pair name
+    int map_len = 0;
+    char **array = malloc(sizeof(char *) * maxkeyfiles * 2); //[ech][key],
+    int somekeyworked=0;
+
+    /*
+     * I really can't see a reason to want >1024 private key files
+     * to have to be checked in a directory, but if there were a
+     * reason then you could change this I guess or make it a 
+     * config setting.
+     */
+    size_t elen=dirname->len;
+
+    for (;;) {
+        nrv=ngx_read_dir(&thedir);
+        if (nrv!=NGX_OK) {
+            break;
+        }
+        char *den=(char*)ngx_de_name(&thedir);
+        size_t nlen=strlen(den);
+        if (nlen>4) {
+            char *last4=den+nlen-4;
+            if (strncmp(last4,".ech",4) && strncmp(last4,".key",4)) {
+                continue;
+            }
+            if ((elen+1+nlen+1)>=PATH_MAX) {
+                ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "load_echkeys, error, name too long: %s with %s",dirname->data,den);
+                continue;
+            }
+            snprintf(privname,PATH_MAX,"%s/%s",dirname->data,den);
+            if (!--maxkeyfiles) {
+                // just so we don't loop forever, ever
+                ngx_ssl_error(NGX_LOG_ALERT, ssl->log, 0, "load_echkeys, too many private key files to check!");
+                ngx_ssl_error(NGX_LOG_ALERT, ssl->log, 0, "load_echkeys, maxkeyfiles is hardcoded to 1024, fix if you like!");
+                return NGX_ERROR;
+            }
+            struct stat thestat;
+            if (stat(privname,&thestat)==0) {
+                char name[64];
+                memcpy(name,den,nlen-4);
+                name[nlen-4] = '\0';
+                int f = -1;
+                for(int m = 0; m < map_len; m++) {
+                    ngx_ssl_error(NGX_LOG_NOTICE, ssl->log, 0, "map[%d]: %s, name: %s", m, map[m], name);
+                    if(strcmp(map[m], name) == 0) {
+                        f = m;
+                        break;
+                    }
+                }
+                if(f == -1) {
+                    map[map_len] = malloc(strlen(name) + 1);
+                    strcpy(map[map_len], name);
+                    f = map_len++;
+                }
+                if (strcmp(last4,".ech") == 0) {
+                    array[f * 2] = malloc(strlen(privname) + 1);
+                    strcpy(array[f * 2], privname);
+                }
+                else {
+                    array[f * 2 + 1] = malloc(strlen(privname) + 1);
+                    strcpy(array[f * 2 + 1], privname);
+                }
+            }
+        }
+    }
+    ngx_close_dir(&thedir);
+
+    SSL_ECH_KEYS *ech_keys = SSL_ECH_KEYS_new();
+    for(int x = 0; x < map_len; x++) {
+        EVP_HPKE_KEY *key = EVP_HPKE_KEY_new();
+        size_t ech_config_len;
+        uint8_t *ech_config = readfile(array[x * 2], &ech_config_len);
+        size_t priv_key_len;
+        uint8_t *priv_key = readfile(array[x * 2 + 1], &priv_key_len);
+        int ret2, ret3;
+        if(!(ech_config_len && priv_key_len) || !(ret2=EVP_HPKE_KEY_init(key, EVP_hpke_x25519_hkdf_sha256(), priv_key, priv_key_len)) || !(ret3 = SSL_ECH_KEYS_add(ech_keys, 1, ech_config, ech_config_len, key))) {
+            ngx_ssl_error(NGX_LOG_ALERT, ssl->log, 0, "load_echkeys, failed for: %s, EVP_HPKE_KEY_init: %d, SSL_ECH_KEYS_add: %d", map[x], ret2, ret3);
+        } else {
+            ngx_ssl_error(NGX_LOG_NOTICE, ssl->log, 0, "load_echkeys, worked for: %s", map[x]);
+            somekeyworked=1;
+        }
+        free(ech_config);
+        free(priv_key);
+    }
+
+    for (int i=0; i<map_len; i++) {
+        free(map[i]);
+        free(array[i * 2]);
+        free(array[i * 2 + 1]);
+    }
+    free(map);
+    free(array);
+
+    if (somekeyworked==0) {
+        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "load_echkeys failed for all keys but ECH configured");
+        return NGX_ERROR;
+    }
+
+    SSL *ssl_ = SSL_new(ssl->ctx);
+    SSL_set_enable_ech_grease(ssl_, 1);
+    SSL_free(ssl_);
+
+    if (!SSL_CTX_set1_ech_keys(ssl->ctx, ech_keys)) {
+        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "load_echkeys SSL_CTX_set1_ech_keys failed");
+        return NGX_ERROR;
+    }
+    ngx_ssl_error(NGX_LOG_NOTICE, ssl->log, 0, "load_echkeys success, loaded %d keys", map_len);
+
+    return NGX_OK;
+}
+
+ngx_int_t
+ngx_ssl_echkeydir(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *dir)
+{
+    if (!dir) {
+        return NGX_OK;
+    }
+    if (dir->len == 0) {
+        return NGX_OK;
+    }
+    if (ngx_conf_full_name(cf->cycle, dir, 1) != NGX_OK) {
+        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "Hey some bad ech stuff happened at %d",__LINE__);
+        return NGX_ERROR;
+    }
+    int rv=load_echkeys(ssl,dir);
+    if (rv!=NGX_OK) {
+        ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0, "Hey some bad ech stuff happened at %d",__LINE__);
+        return rv;
+    }
+    return NGX_OK;
+}
+
+ngx_int_t
+ngx_ssl_get_ech_status(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
+{
+    char buf[PATH_MAX];
+    int echrv=SSL_ech_get_status(c);
+    switch (echrv) {
+    case SSL_ECH_STATUS_NOT_TRIED:
+        snprintf(buf,PATH_MAX,"not attempted");
+        break;
+    case SSL_ECH_STATUS_FAILED:
+        snprintf(buf, PATH_MAX, "tried but failed");
+        break;
+    case SSL_ECH_STATUS_BAD_NAME:
+        snprintf(buf, PATH_MAX,"worked but bad name");
+        break;
+    case SSL_ECH_STATUS_SUCCESS:
+        snprintf(buf, PATH_MAX, "success");
+        break;
+    default:
+        snprintf(buf, PATH_MAX, "error getting ECH status");
+        break;
+    }
+    s->len = ngx_strlen(buf);
+    s->data = ngx_pnalloc(pool, s->len);
+    ngx_memcpy(s->data,buf,s->len);
+    return NGX_OK;
+}
+
+#endif
 
 ngx_int_t
 ngx_ssl_dhparam(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *file)
@@ -1715,6 +2175,13 @@ ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c, ngx_uint_t flags)
     }
 
     c->ssl = sc;
+
+#ifndef BSSL_NO_ECH
+#if (NGX_DEBUG)
+    SSL_set_msg_callback(sc->connection, ssl_trace);
+    SSL_set_msg_callback_arg(sc->connection, c->log);
+#endif
+#endif
 
     return NGX_OK;
 }
@@ -4937,7 +5404,6 @@ ngx_ssl_get_cipher_name(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     s->data = (u_char *) SSL_get_cipher_name(c->ssl->connection);
     return NGX_OK;
 }
-
 
 ngx_int_t
 ngx_ssl_get_ciphers(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
