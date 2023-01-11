@@ -1823,6 +1823,7 @@ ngx_ssl_get_ech_status(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     }
     s->len = ngx_strlen(buf);
     s->data = ngx_pnalloc(pool, s->len);
+    ngx_ssl_error(NGX_LOG_EMERG, c->log, 0, "Tried getting ECH status, got: %s", buf);
     ngx_memcpy(s->data,buf,s->len);
     return NGX_OK;
 }

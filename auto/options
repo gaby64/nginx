@@ -363,7 +363,7 @@ use the \"--with-mail_ssl_module\" option instead"
         --with-openssl=*)                OPENSSL="$value"           ;;
         --with-openssl-opt=*)            OPENSSL_OPT="$value"       ;;
 
-        --with-bsslech)                  BSSL_NO_ECH=YES         ;;
+        --with-bsslech)                  BSSL_NO_ECH=YES            ;;
 
         --with-md5=*)
             NGX_POST_CONF_MSG="$NGX_POST_CONF_MSG
